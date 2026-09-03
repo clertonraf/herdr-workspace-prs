@@ -8,6 +8,7 @@ import { runPollOnce, type WorkspacePrItem } from "./daemon.ts";
 const SOCKET_PATH = process.env.HERDR_SOCKET_PATH || `${process.env.HOME}/.config/herdr/herdr.sock`;
 const STATE_DIR = process.env.HERDR_PLUGIN_STATE_DIR || os.tmpdir();
 const STATE_FILE = path.join(STATE_DIR, "herdr-workspace-prs-state.json");
+const LEGACY_STATE_FILE = "/tmp/herdr-workspace-prs-state.json";
 const ITEM_LINES = 4;
 const HEADER_LINES = 2;
 const FOOTER_LINES = 1;
@@ -67,11 +68,14 @@ interface PickerState {
 }
 
 function loadState(): PickerState {
-  try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")) as PickerState;
-  } catch {
-    return { workspaces: {}, workspaceLabels: {} };
+  for (const file of [STATE_FILE, LEGACY_STATE_FILE]) {
+    try {
+      return JSON.parse(fs.readFileSync(file, "utf8")) as PickerState;
+    } catch {
+      // Try the compatibility location next.
+    }
   }
+  return { workspaces: {}, workspaceLabels: {} };
 }
 
 async function main() {
