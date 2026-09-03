@@ -1,0 +1,27 @@
+id = "herdr-workspace-prs"
+name = "Workspace PR Tracker"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Tracks open GitHub PRs for workspaces in the sidebar and provides a popup PR picker"
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["bun", "run", "start.ts"]
+
+[[actions]]
+id = "refresh"
+title = "Refresh Workspace PRs"
+contexts = ["global", "workspace"]
+command = ["bun", "run", "refresh.ts"]
+
+[[actions]]
+id = "open"
+title = "Open Workspace PRs"
+contexts = ["global", "workspace"]
+command = ["bun", "run", "open.ts"]
+
+[[panes]]
+id = "picker"
+title = "Workspace PRs"
+placement = "popup"
+command = ["bun", "run", "picker.ts"]
