@@ -7,6 +7,7 @@ import type { WorkspacePrItem } from "./daemon.ts";
 const SOCKET_PATH = process.env.HERDR_SOCKET_PATH || `${process.env.HOME}/.config/herdr/herdr.sock`;
 const STATE_DIR = process.env.HERDR_PLUGIN_STATE_DIR || os.tmpdir();
 const STATE_FILE = path.join(STATE_DIR, "herdr-workspace-prs-state.json");
+const SYSTEM_STATE_FILE = path.join(os.tmpdir(), "herdr-workspace-prs-state.json");
 const LEGACY_STATE_FILE = "/tmp/herdr-workspace-prs-state.json";
 const PLUGIN_ID = process.env.HERDR_PLUGIN_ID || "herdr-workspace-prs";
 const ENTRYPOINT = "picker";
@@ -16,7 +17,7 @@ interface State {
 }
 
 function loadState(): State {
-  for (const file of [STATE_FILE, LEGACY_STATE_FILE]) {
+  for (const file of [STATE_FILE, SYSTEM_STATE_FILE, LEGACY_STATE_FILE]) {
     try {
       return JSON.parse(fs.readFileSync(file, "utf8")) as State;
     } catch {
