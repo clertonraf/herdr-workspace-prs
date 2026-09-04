@@ -3,7 +3,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { WorkspacePrItem } from "./daemon.ts";
-import type { WorkspaceLinkData } from "./links.ts";
+import { loadWorkspaceLinks, type WorkspaceLinkData } from "./links.ts";
 
 const SOCKET_PATH = process.env.HERDR_SOCKET_PATH || `${process.env.HOME}/.config/herdr/herdr.sock`;
 const STATE_DIR = process.env.HERDR_PLUGIN_STATE_DIR || os.tmpdir();
@@ -12,6 +12,7 @@ const SYSTEM_STATE_FILE = path.join(os.tmpdir(), "herdr-workspace-prs-state.json
 const LEGACY_STATE_FILE = "/tmp/herdr-workspace-prs-state.json";
 const PLUGIN_ID = process.env.HERDR_PLUGIN_ID || "herdr-workspace-prs";
 const ENTRYPOINT = "picker";
+const MIN_POPUP_HEIGHT = 50;
 
 interface State {
   workspaces: Record<string, WorkspacePrItem[]>;
@@ -29,7 +30,7 @@ function loadState(): State {
   return { workspaces: {} };
 }
 
-function request(method: string, params: Record<string, unknown>): Promise<unknown> {
+function request(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const client = net.createConnection(SOCKET_PATH);
     let buffer = "";
@@ -61,23 +62,46 @@ function request(method: string, params: Record<string, unknown>): Promise<unkno
 }
 
 async function main() {
-  const workspaceId = process.env.HERDR_WORKSPACE_ID || process.env.HERDR_ACTIVE_WORKSPACE_ID;
-  const state = loadState();
-  const prs = workspaceId ? state.workspaces[workspaceId] || [] : [];
-  const linkData = workspaceId && state.workspaceLinks ? state.workspaceLinks[workspaceId] : undefined;
-  const links = linkData?.links || [];
-  const notes = linkData?.notes || [];
-
+  let workspaceId = process.env.HERDR_WORKSPACE_ID || process.env.HERDR_ACTIVE_WORKSPACE_ID;
+  let cwds: string[] = [];
   let terminalHeight = 40;
+
+  try {
+    const snapRes = (await request("session.snapshot")) as {
+      snapshot?: {
+        focused_workspace_id?: string;
+        panes?: Array<{ workspace_id: string; cwd?: string; foreground_cwd?: string }>;
+      };
+    };
+    if (!workspaceId && snapRes?.snapshot?.focused_workspace_id) {
+      workspaceId = snapRes.snapshot.focused_workspace_id;
+    }
+    const panes = (snapRes?.snapshot?.panes || []).filter((p) => p.workspace_id === workspaceId);
+    cwds = Array.from(new Set(panes.map((p) => p.foreground_cwd || p.cwd).filter(Boolean))) as string[];
+  } catch {}
+
   const paneId = process.env.HERDR_PANE_ID || process.env.HERDR_ACTIVE_PANE_ID;
   try {
-    const result = (await request("pane.layout", paneId ? { pane_id: paneId } : {})) as {
+    const layoutRes = (await request("pane.layout", paneId ? { pane_id: paneId } : {})) as {
       layout?: { area?: { height?: number } };
     };
-    terminalHeight = result.layout?.area?.height || terminalHeight;
-  } catch {
-    // The popup can still use the fallback and its own scrolling.
+    terminalHeight = layoutRes.layout?.area?.height || terminalHeight;
+  } catch {}
+
+  const state = loadState();
+  const prs = workspaceId ? state.workspaces[workspaceId] || [] : [];
+
+  let linkData: WorkspaceLinkData = cwds.length > 0 ? loadWorkspaceLinks(cwds) : {
+    links: [],
+    notes: [],
+    linksFile: null,
+    workspaceRoot: null,
+  };
+  if (linkData.links.length === 0 && linkData.notes.length === 0 && workspaceId && state.workspaceLinks?.[workspaceId]) {
+    linkData = state.workspaceLinks[workspaceId];
   }
+  const links = linkData.links;
+  const notes = linkData.notes;
 
   let contentLines = 0;
   if (prs.length > 0) contentLines += 2 + prs.length * 4;
@@ -85,15 +109,15 @@ async function main() {
   if (notes.length > 0) contentLines += 2 + notes.length;
   if (prs.length === 0 && links.length === 0 && notes.length === 0) contentLines = 3;
 
-  const desiredHeight = contentLines + 5;
-  const maxHeight = Math.max(8, Math.min(terminalHeight - 4, Math.floor(terminalHeight * 0.85)));
-  const height = Math.min(desiredHeight, maxHeight);
+  const desiredHeight = contentLines + 6;
+  const maxHeight = Math.max(10, Math.min(terminalHeight - 4, Math.floor(terminalHeight * 0.85)));
+  const height = Math.min(Math.max(MIN_POPUP_HEIGHT, desiredHeight), maxHeight);
 
   await request("plugin.pane.open", {
     plugin_id: PLUGIN_ID,
     entrypoint: ENTRYPOINT,
     placement: "popup",
-    width: "75%",
+    width: "80%",
     height,
     focus: true,
     env: workspaceId ? { HERDR_WORKSPACE_ID: workspaceId } : {},

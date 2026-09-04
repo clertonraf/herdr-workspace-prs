@@ -317,6 +317,10 @@ async function main() {
 
   render();
 
+  if (process.stdout.isTTY) {
+    process.stdout.on("resize", () => render());
+  }
+
   if (process.stdin.isTTY) process.stdin.setRawMode(true);
   process.stdin.resume();
   const keepAlive = setInterval(() => {}, 60 * 60 * 1000);
