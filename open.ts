@@ -3,6 +3,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { WorkspacePrItem } from "./daemon.ts";
+import type { WorkspaceLinkData } from "./links.ts";
 
 const SOCKET_PATH = process.env.HERDR_SOCKET_PATH || `${process.env.HOME}/.config/herdr/herdr.sock`;
 const STATE_DIR = process.env.HERDR_PLUGIN_STATE_DIR || os.tmpdir();
@@ -14,6 +15,7 @@ const ENTRYPOINT = "picker";
 
 interface State {
   workspaces: Record<string, WorkspacePrItem[]>;
+  workspaceLinks?: Record<string, WorkspaceLinkData>;
 }
 
 function loadState(): State {
@@ -60,7 +62,11 @@ function request(method: string, params: Record<string, unknown>): Promise<unkno
 
 async function main() {
   const workspaceId = process.env.HERDR_WORKSPACE_ID || process.env.HERDR_ACTIVE_WORKSPACE_ID;
-  const prs = workspaceId ? loadState().workspaces[workspaceId] || [] : [];
+  const state = loadState();
+  const prs = workspaceId ? state.workspaces[workspaceId] || [] : [];
+  const linkData = workspaceId && state.workspaceLinks ? state.workspaceLinks[workspaceId] : undefined;
+  const links = linkData?.links || [];
+  const notes = linkData?.notes || [];
 
   let terminalHeight = 40;
   const paneId = process.env.HERDR_PANE_ID || process.env.HERDR_ACTIVE_PANE_ID;
@@ -73,9 +79,14 @@ async function main() {
     // The popup can still use the fallback and its own scrolling.
   }
 
-  // Header (2) + PR blocks (4 each) + footer (1) + popup borders (2).
-  const desiredHeight = prs.length > 0 ? 5 + prs.length * 4 : 8;
-  const maxHeight = Math.max(7, Math.min(terminalHeight - 4, Math.floor(terminalHeight * 0.8)));
+  let contentLines = 0;
+  if (prs.length > 0) contentLines += 2 + prs.length * 4;
+  if (links.length > 0) contentLines += 2 + links.length * 3;
+  if (notes.length > 0) contentLines += 2 + notes.length;
+  if (prs.length === 0 && links.length === 0 && notes.length === 0) contentLines = 3;
+
+  const desiredHeight = contentLines + 5;
+  const maxHeight = Math.max(8, Math.min(terminalHeight - 4, Math.floor(terminalHeight * 0.85)));
   const height = Math.min(desiredHeight, maxHeight);
 
   await request("plugin.pane.open", {

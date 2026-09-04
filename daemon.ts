@@ -3,6 +3,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { loadWorkspaceLinks, type WorkspaceLinkData, type WorkspaceLinkItem } from "./links.ts";
+
+export type { WorkspaceLinkData, WorkspaceLinkItem };
 
 const SOCKET_PATH = process.env.HERDR_SOCKET_PATH || `${process.env.HOME}/.config/herdr/herdr.sock`;
 const STATE_DIR = process.env.HERDR_PLUGIN_STATE_DIR || os.tmpdir();
@@ -180,6 +183,7 @@ export async function runPollOnce(): Promise<Record<string, WorkspacePrItem[]>> 
   if (!snapshot || !Array.isArray(snapshot.workspaces)) return {};
 
   const workspacesMap: Record<string, WorkspacePrItem[]> = {};
+  const workspaceLinksMap: Record<string, WorkspaceLinkData> = {};
   const records: Array<{ workspace: any; prs: WorkspacePrItem[] }> = [];
 
   // Discover every workspace first. Column widths must be global, not per workspace.
@@ -188,6 +192,8 @@ export async function runPollOnce(): Promise<Record<string, WorkspacePrItem[]>> 
     const uniqueCwds = Array.from(new Set(panes.map((p: any) => p.foreground_cwd || p.cwd).filter(Boolean))) as string[];
     const prs: WorkspacePrItem[] = [];
     const seenPrKeys = new Set<string>();
+
+    workspaceLinksMap[ws.workspace_id] = loadWorkspaceLinks(uniqueCwds);
 
     for (const cwd of uniqueCwds) {
       const gitInfo = getGitBranchInfo(cwd);
@@ -294,6 +300,7 @@ export async function runPollOnce(): Promise<Record<string, WorkspacePrItem[]>> 
           updatedAt: Date.now(),
           workspaces: workspacesMap,
           workspaceLabels: Object.fromEntries(snapshot.workspaces.map((w: any) => [w.workspace_id, w.label])),
+          workspaceLinks: workspaceLinksMap,
         },
         null,
         2
