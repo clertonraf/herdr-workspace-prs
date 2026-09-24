@@ -16,8 +16,8 @@ const POLL_INTERVAL_MS = 15000;
 const PR_CACHE_TTL_MS = 30000;
 // Hard ceiling: herdr rejects a workspace metadata update past 32 total tokens, and a
 // few are already used by other plugins (space_label, space_idle, space_logo_*), plus
-// 3 tokens per PR row (repo/num/status) — 9 is the safe max that stays under that cap.
-const MAX_PRS_PER_WORKSPACE = 9;
+// 4 tokens per PR row (repo/num/status/health) — 7 is the safe max that stays under it.
+const MAX_PRS_PER_WORKSPACE = 7;
 const REPO_COLUMN_WIDTH = 10;
 const NUMBER_COLUMN_WIDTH = 5;
 const STATUS_COLUMN_WIDTH = 8;
@@ -171,7 +171,19 @@ async function fetchPrForBranch(fullRepo: string, branch: string): Promise<any |
 
   try {
     const proc = Bun.spawn(
-      ["gh", "pr", "list", "--repo", fullRepo, "--head", branch, "--state", "all", "--json", "number,title,state,isDraft,url"],
+      [
+        "gh",
+        "pr",
+        "list",
+        "--repo",
+        fullRepo,
+        "--head",
+        branch,
+        "--state",
+        "all",
+        "--json",
+        "number,title,state,isDraft,url,mergeStateStatus,statusCheckRollup",
+      ],
       { stdout: "pipe", stderr: "ignore" }
     );
     const text = await new Response(proc.stdout).text();
@@ -203,6 +215,29 @@ function getStatusBadge(pr: any): string {
   if (s === "merged") return "(merged)";
   if (s === "closed") return "(closed)";
   return `(${s})`;
+}
+
+type PrHealth = "ready" | "ci_fail" | "behind" | "pending";
+const HEALTH_EMOJI: Record<PrHealth, string> = {
+  ready: "✅", // check mark, all clear to merge
+  ci_fail: "❌", // cross mark, a required check failed
+  behind: "🔄", // arrows, branch is behind its base
+  pending: "⏳", // hourglass, anything else (review required, conflicts, draft, still computing)
+};
+
+// GitHub's statusCheckRollup mixes modern CheckRun entries (conclusion) with legacy
+// commit-status entries (state) — only count a genuine failure, not a still-running
+// or intentionally-skipped check, as a CI error.
+function classifyPrHealth(pr: any): PrHealth {
+  const checks = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [];
+  const hasFailure = checks.some((c: any) => {
+    const outcome = c.conclusion ?? c.state;
+    return outcome === "FAILURE" || outcome === "ERROR" || outcome === "TIMED_OUT" || outcome === "CANCELLED";
+  });
+  if (hasFailure) return "ci_fail";
+  if (pr.mergeStateStatus === "BEHIND") return "behind";
+  if (pr.mergeStateStatus === "CLEAN") return "ready";
+  return "pending";
 }
 
 let reqCounter = 0;
@@ -240,6 +275,7 @@ export interface WorkspacePrItem {
   state: string;
   isDraft: boolean;
   statusBadge: string;
+  health: PrHealth;
   url: string;
   displayLine: string;
 }
@@ -316,6 +352,7 @@ export async function runPollOnce(): Promise<Record<string, WorkspacePrItem[]>> 
         seenPrKeys.add(prKey);
 
         const statusBadge = getStatusBadge(pr);
+        const health = classifyPrHealth(pr);
         prs.push({
           repo: gitInfo.repo,
           repoFull: gitInfo.full,
@@ -325,8 +362,9 @@ export async function runPollOnce(): Promise<Record<string, WorkspacePrItem[]>> 
           state: pr.state,
           isDraft: !!pr.isDraft,
           statusBadge,
+          health,
           url: pr.url,
-          displayLine: `${gitInfo.repo} #${pr.number} ${statusBadge}`,
+          displayLine: `${HEALTH_EMOJI[health]} ${gitInfo.repo} #${pr.number} ${statusBadge}`,
         });
       }
     }
@@ -348,6 +386,7 @@ export async function runPollOnce(): Promise<Record<string, WorkspacePrItem[]>> 
     for (let i = 0; i < count; i++) {
       const pr = prs[i];
       const prefix = `pr_${i + 1}`;
+      currentTokens[`${prefix}_health_${pr.health}`] = HEALTH_EMOJI[pr.health];
       currentTokens[`${prefix}_repo`] = padEnd(pr.repo, repoWidth);
       currentTokens[`${prefix}_num`] = padEnd(`#${pr.number}`, numberWidth);
 
@@ -373,9 +412,9 @@ export async function runPollOnce(): Promise<Record<string, WorkspacePrItem[]>> 
     }
 
     // Clear keys from this daemon, including stale status keys after a restart.
-    const reportedPrKey = /^pr_[1-9]_(repo|num|open|merged|draft|closed)$/;
+    const reportedPrKey = /^pr_[1-7]_(repo|num|open|merged|draft|closed|health_ready|health_ci_fail|health_behind|health_pending)$/;
     for (const oldKey of new Set([...prevTokens, ...Object.keys(ws.tokens || {})])) {
-      if ((reportedPrKey.test(oldKey) || /^pr_[1-9]$/.test(oldKey)) && !currentKeys.has(oldKey)) {
+      if ((reportedPrKey.test(oldKey) || /^pr_[1-7]$/.test(oldKey)) && !currentKeys.has(oldKey)) {
         hasChanges = true;
         keysToReport[oldKey] = null;
       }
