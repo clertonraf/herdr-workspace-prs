@@ -14,7 +14,10 @@ const PID_FILE = path.join(STATE_DIR, "herdr-workspace-prs.pid");
 const LOG_FILE = path.join(STATE_DIR, "herdr-workspace-prs.log");
 const POLL_INTERVAL_MS = 15000;
 const PR_CACHE_TTL_MS = 30000;
-const MAX_PRS_PER_WORKSPACE = 5;
+// Hard ceiling: herdr rejects a workspace metadata update past 32 total tokens, and a
+// few are already used by other plugins (space_label, space_idle, space_logo_*), plus
+// 3 tokens per PR row (repo/num/status) — 9 is the safe max that stays under that cap.
+const MAX_PRS_PER_WORKSPACE = 9;
 const REPO_COLUMN_WIDTH = 10;
 const NUMBER_COLUMN_WIDTH = 5;
 const STATUS_COLUMN_WIDTH = 8;
@@ -60,38 +63,102 @@ function parseGithubRepo(url: string): { owner: string; repo: string; full: stri
   return { owner: match[1], repo: match[2], full: `${match[1]}/${match[2]}` };
 }
 
-function getGitBranchInfo(cwd: string): GitBranchInfo | null {
+// Pull a ticket-style ID (e.g. "CT-5098") out of a pane's terminal title, so a pane
+// whose live cwd sits at a shared repo root can still be matched to its worktree(s) below.
+function extractTicketHint(title: string): string | null {
+  const match = title.match(/[A-Za-z]{2,}-\d+/);
+  return match ? match[0].toLowerCase() : null;
+}
+
+function getRepoRootAndBranch(cwd: string): { root: string; branch: string } | null {
   try {
     const res = spawnSync("git", ["-C", cwd, "rev-parse", "--show-toplevel", "--abbrev-ref", "HEAD"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     });
     if (res.status !== 0 || !res.stdout) return null;
-    const lines = res.stdout.trim().split("\n");
-    if (lines.length < 2) return null;
-    const [root, branch] = lines;
-    if (!root || !branch || branch === "HEAD" || branch === "main" || branch === "master" || branch === "develop") {
-      return null;
-    }
+    const [root, branch] = res.stdout.trim().split("\n");
+    if (!root || !branch) return null;
+    return { root, branch };
+  } catch {
+    return null;
+  }
+}
 
-    let originUrl = originUrlCache.get(root);
-    if (originUrl === undefined) {
+function resolveOriginRepo(root: string): { owner: string; repo: string; full: string } | null {
+  let originUrl = originUrlCache.get(root);
+  if (originUrl === undefined) {
+    try {
       const remoteRes = spawnSync("git", ["-C", root, "config", "--get", "remote.origin.url"], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
       });
       originUrl = remoteRes.stdout ? remoteRes.stdout.trim() : null;
-      originUrlCache.set(root, originUrl);
+    } catch {
+      originUrl = null;
     }
-    if (!originUrl) return null;
-
-    const gh = parseGithubRepo(originUrl);
-    if (!gh) return null;
-
-    return { root, branch, owner: gh.owner, repo: gh.repo, full: gh.full };
-  } catch {
-    return null;
+    originUrlCache.set(root, originUrl);
   }
+  if (!originUrl) return null;
+  return parseGithubRepo(originUrl);
+}
+
+function getGitBranchInfo(cwd: string): GitBranchInfo | null {
+  const rb = getRepoRootAndBranch(cwd);
+  if (!rb) return null;
+  const { root, branch } = rb;
+  if (branch === "HEAD" || branch === "main" || branch === "master" || branch === "develop") return null;
+
+  const gh = resolveOriginRepo(root);
+  if (!gh) return null;
+  return { root, branch, owner: gh.owner, repo: gh.repo, full: gh.full };
+}
+
+// Fallback for a pane whose real OS cwd is still a shared base checkout (on main),
+// not the worktree it actually edits — happens when an agent process never chdir's
+// into the worktree. Scans every repo under the sibling `worktrees/` directory (the
+// standard `<parent>/worktrees/<repo>/<branch>` layout) for a directory matching the
+// pane's ticket ID, since one ticket can span multiple repos (its own PR in each).
+function findWorktreeMatchesAcrossRepos(anchorRoot: string, ticketHint: string): GitBranchInfo[] {
+  const worktreesRoot = path.join(path.dirname(anchorRoot), "worktrees");
+  let repoDirs: string[];
+  try {
+    repoDirs = fs
+      .readdirSync(worktreesRoot, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+  } catch {
+    return [];
+  }
+
+  const results: GitBranchInfo[] = [];
+  const seen = new Set<string>();
+  for (const repoDir of repoDirs) {
+    const repoWorktreesPath = path.join(worktreesRoot, repoDir);
+    let entries: string[];
+    try {
+      entries = fs
+        .readdirSync(repoWorktreesPath, { withFileTypes: true })
+        .filter((d) => d.isDirectory())
+        .map((d) => d.name);
+    } catch {
+      continue;
+    }
+
+    for (const name of entries) {
+      if (!name.toLowerCase().includes(ticketHint)) continue;
+      const wtPath = path.join(repoWorktreesPath, name);
+      const rb = getRepoRootAndBranch(wtPath);
+      if (!rb) continue;
+      const gh = resolveOriginRepo(rb.root);
+      if (!gh) continue;
+      const key = `${gh.full}:${rb.branch}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      results.push({ root: rb.root, branch: rb.branch, owner: gh.owner, repo: gh.repo, full: gh.full });
+    }
+  }
+  return results;
 }
 
 async function fetchPrForBranch(fullRepo: string, branch: string): Promise<any | null> {
@@ -195,30 +262,73 @@ export async function runPollOnce(): Promise<Record<string, WorkspacePrItem[]>> 
 
     workspaceLinksMap[ws.workspace_id] = loadWorkspaceLinks(uniqueCwds);
 
-    for (const cwd of uniqueCwds) {
-      const gitInfo = getGitBranchInfo(cwd);
-      if (!gitInfo) continue;
+    // Fallback anchors for a pane whose own cwd isn't inside any git repo at all
+    // (e.g. still at $HOME — the agent process never cd'd anywhere). Reuse whatever
+    // repo roots sibling panes in the same workspace already resolve to, since they're
+    // grouped there for the same project.
+    const workspaceAnchorRoots = new Set<string>();
+    for (const p of panes) {
+      const cwd = (p as any).foreground_cwd || (p as any).cwd;
+      if (!cwd) continue;
+      const rb = getRepoRootAndBranch(cwd);
+      if (rb) workspaceAnchorRoots.add(rb.root);
+    }
 
-      const pr = await fetchPrForBranch(gitInfo.full, gitInfo.branch);
-      if (!pr) continue;
+    // Iterate panes individually rather than deduped cwds: multiple ticket panes can
+    // share one live cwd (the base repo checkout), and only the per-pane title tells
+    // them apart once getGitBranchInfo falls back to worktree matching.
+    const seenCwdHints = new Set<string>();
+    for (const p of panes) {
+      const cwd = (p as any).foreground_cwd || (p as any).cwd;
+      if (!cwd) continue;
+      const title = (p as any).terminal_title_stripped || (p as any).terminal_title || "";
+      const ticketHint = extractTicketHint(title);
+      const dedupeKey = `${cwd}::${ticketHint || ""}`;
+      if (seenCwdHints.has(dedupeKey)) continue;
+      seenCwdHints.add(dedupeKey);
 
-      const prKey = `${gitInfo.repo}#${pr.number}`;
-      if (seenPrKeys.has(prKey)) continue;
-      seenPrKeys.add(prKey);
+      // A ticket can span multiple repos (each with its own PR), so this can yield
+      // more than one candidate — direct branch match, or every worktree elsewhere
+      // whose directory name matches the pane's ticket ID.
+      let candidates: GitBranchInfo[] = [];
+      const direct = getGitBranchInfo(cwd);
+      if (direct) {
+        candidates = [direct];
+      } else if (ticketHint) {
+        const rb = getRepoRootAndBranch(cwd);
+        const anchors = rb ? [rb.root] : Array.from(workspaceAnchorRoots);
+        const merged = new Map<string, GitBranchInfo>();
+        for (const anchor of anchors) {
+          for (const info of findWorktreeMatchesAcrossRepos(anchor, ticketHint)) {
+            merged.set(`${info.full}:${info.branch}`, info);
+          }
+        }
+        candidates = Array.from(merged.values());
+      }
 
-      const statusBadge = getStatusBadge(pr);
-      prs.push({
-        repo: gitInfo.repo,
-        repoFull: gitInfo.full,
-        branch: gitInfo.branch,
-        number: pr.number,
-        title: pr.title || "",
-        state: pr.state,
-        isDraft: !!pr.isDraft,
-        statusBadge,
-        url: pr.url,
-        displayLine: `${gitInfo.repo} #${pr.number} ${statusBadge}`,
-      });
+      for (const gitInfo of candidates) {
+        const pr = await fetchPrForBranch(gitInfo.full, gitInfo.branch);
+        if (!pr) continue;
+        if (pr.state === "MERGED") continue; // done work; not worth a sidebar slot
+
+        const prKey = `${gitInfo.repo}#${pr.number}`;
+        if (seenPrKeys.has(prKey)) continue;
+        seenPrKeys.add(prKey);
+
+        const statusBadge = getStatusBadge(pr);
+        prs.push({
+          repo: gitInfo.repo,
+          repoFull: gitInfo.full,
+          branch: gitInfo.branch,
+          number: pr.number,
+          title: pr.title || "",
+          state: pr.state,
+          isDraft: !!pr.isDraft,
+          statusBadge,
+          url: pr.url,
+          displayLine: `${gitInfo.repo} #${pr.number} ${statusBadge}`,
+        });
+      }
     }
 
     workspacesMap[ws.workspace_id] = prs;
@@ -263,9 +373,9 @@ export async function runPollOnce(): Promise<Record<string, WorkspacePrItem[]>> 
     }
 
     // Clear keys from this daemon, including stale status keys after a restart.
-    const reportedPrKey = /^pr_[1-5]_(repo|num|open|merged|draft|closed)$/;
+    const reportedPrKey = /^pr_[1-9]_(repo|num|open|merged|draft|closed)$/;
     for (const oldKey of new Set([...prevTokens, ...Object.keys(ws.tokens || {})])) {
-      if ((reportedPrKey.test(oldKey) || /^pr_[1-5]$/.test(oldKey)) && !currentKeys.has(oldKey)) {
+      if ((reportedPrKey.test(oldKey) || /^pr_[1-9]$/.test(oldKey)) && !currentKeys.has(oldKey)) {
         hasChanges = true;
         keysToReport[oldKey] = null;
       }
